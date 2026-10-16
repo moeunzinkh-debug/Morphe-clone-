@@ -129,8 +129,28 @@ jobs:
           echo "--- native libraries ---"
           unzip -l "dist/$NAME.apk" | grep -E ' lib/' | awk '{print $4, $1}' | sort | head -20 || true
           echo "--- size ---"
-          ls -lh dist/ ; stat -c '%n %s bytes' "dist/$NAME.apk"
-          (cd dist && sha256sum "$NAME.apk" > "$NAME.apk.sha256")
+          ls -lh dist/
+          SIZE="$(stat -c '%s' "dist/$NAME.apk")"
+          SHA="$(sha256sum "dist/$NAME.apk" | awk '{print $1}')"
+          echo "$NAME.apk: $SIZE bytes"
+          echo "sha256: $SHA"
+
+          {
+            echo "## microg-${{ matrix.abi }}"
+            echo
+            echo '| field | value |'
+            echo '| --- | --- |'
+            echo "| file | \`$NAME.apk\` |"
+            echo "| size | $SIZE bytes ($(awk -v s="$SIZE" 'BEGIN{printf "%.2f", s/1048576}') MB) |"
+            echo "| sha256 | \`$SHA\` |"
+            echo "| package | ${{ matrix.abi }} |"
+            echo
+            echo '```'
+            "$BUILD_TOOLS/aapt" dump badging "dist/$NAME.apk" | head -3
+            "$BUILD_TOOLS/apksigner" verify --print-certs "dist/$NAME.apk" | head -8
+            unzip -l "dist/$NAME.apk" | grep -E ' lib/' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Upload APK"
         uses: actions/upload-artifact@v7
@@ -138,4 +158,4 @@ jobs:
           name: microg-${{ matrix.abi }}
           if-no-files-found: error
           archive: false
-          path: dist/
+          path: dist/*.apk
