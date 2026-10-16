@@ -7,6 +7,32 @@
 
 កូដ build ដូចគ្នា ប្រភពដូចគ្នា — គ្រាន់តែបញ្ជា build ផ្សេងគ្នា (`-Pabi=...`) ។
 
+## តើ 40MB នោះជា "release APK" មែនទេ?
+
+**បាទ/ចាស — តែ 107MB ក៏ជា release APK ដែរ។** ទាំង 6 asset នៅក្នុង release page
+សុទ្ធតែចេញពី task ដូចគ្នា `:play-services-core:assembleDefaultRelease`
+(product flavor `default` + build type `release`) រួចចុះហត្ថលេខាដោយ
+`ilharp/sign-android-release` ជាមួយ keystore របស់ project (`.github/workflows/release.yml`)។
+
+**ដូច្នេះ ភាពខុសគ្នា 107MB vs 43MB មិនមែន debug vs release ទេ — វាជាចំនួន ABI ។**
+
+| Build type | Command ក្នុង `release.yml` | ABI | Asset | ទំហំ |
+| --- | --- | --- | --- | ---: |
+| **release** | `assembleDefaultRelease` | 4 | `microg-7.2.1.apk` | 107.16 MB |
+| **release** | `assembleDefaultRelease -Pabi=arm64-v8a` | 1 | `...-icon-arm64-v8a.apk` | 42.85 MB |
+| **release** | `assembleDefaultRelease -Pabi=armeabi-v7a` | 1 | `...-icon-armeabi-v7a.apk` | 40.74 MB |
+| **release** | `assembleDefaultRelease -PnoIcon=true` | 4 | `...-noicon.apk` | 107.16 MB |
+| **release** | `assembleDefaultRelease -PnoIcon=true -Pabi=arm64-v8a` | 1 | `...-noicon-arm64-v8a.apk` | 42.85 MB |
+| **release** | `assembleDefaultRelease -PnoIcon=true -Pabi=armeabi-v7a` | 1 | `...-noicon-armeabi-v7a.apk` | 40.74 MB |
+
+ចំណាំបន្ថែម៖
+
+- ក្នុង `build.gradle` របស់ `play-services-core` release កំណត់ `minifyEnabled false`
+  (គ្មាន R8 shrink) → ដូច្នេះ "release" មិនមានន័យថាតូចទេ។ ទំហំកំណត់ដោយ ABI ។
+- Build **debug** ដែលដាក់ `-Pabi` ដូចគ្នា ក៏បានទំហំជិតស្មើគ្នាដែរ (ខុសគ្នាបន្តិចបន្តួច)។
+- ពាក្យ `-icon-` / `-noicon-` នៅក្នុងឈ្មោះឯកសារ គ្រាន់តែបង្ហាញ/លាក់ icon ក្នុង launcher
+  ប៉ុណ្ណោះ — មិនពាក់ព័ន្ធនឹង build type ឬទំហំទេ។
+
 ## លេខពិត (ពី GitHub Release ផ្លូវការ `MorpheApp/MicroG-RE` v7.2.1)
 
 | Asset | ទំហំពិត (bytes) | ទំហំ | ABI នៅក្នុង |
