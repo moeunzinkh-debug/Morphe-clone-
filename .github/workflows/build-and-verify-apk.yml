@@ -1,0 +1,115 @@
+name: Build and verify APK
+
+on:
+  pull_request:
+    paths:
+      - 'play-services-core/src/main/kotlin/org/microg/gms/ui/updater/**'
+      - 'play-services-core/src/test/**'
+      - 'play-services-core/build.gradle'
+      - '.github/workflows/build-and-verify-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build, sign and verify the APK
+    runs-on: ubuntu-latest
+    env:
+      GRADLE_MICROG_VERSION_WITHOUT_GIT: "1"
+
+    steps:
+      - name: "Checkout sources"
+        uses: actions/checkout@v7
+
+      - name: "Setup Java"
+        uses: actions/setup-java@v6
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: "Setup Gradle"
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: "Run unit tests"
+        run: "./gradlew --no-daemon :play-services-core:testDefaultReleaseUnitTest"
+
+      - name: "Build release APK"
+        run: "./gradlew --no-daemon :play-services-core:assembleDefaultRelease"
+
+      - name: "Sign and verify the APK"
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+
+          # The official release is signed with the maintainers' key, which is not available
+          # to a pull request, so the verification build gets its own throwaway key. The
+          # result is a valid, installable APK, but it cannot upgrade an installation that
+          # was signed with the release key.
+          keytool -genkeypair -v -keystore verify.jks -alias verify \
+            -keyalg RSA -keysize 4096 -validity 10000 \
+            -storepass verify -keypass verify \
+            -dname "CN=MicroG-RE verification build, OU=Build, O=Morphe, C=US"
+
+          mkdir -p dist
+          APK="$(find play-services-core/build/outputs/apk -name '*.apk' | head -1)"
+          echo "Built APK: $APK"
+          "$BUILD_TOOLS/zipalign" -p -f 4 "$APK" dist/microg-unaligned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks verify.jks --ks-pass pass:verify --key-pass pass:verify --ks-key-alias verify \
+            --out dist/microg-verify.apk dist/microg-unaligned.apk
+
+          # The same checks the release workflow runs: the archive must be intact and it
+          # must carry a readable signature. A malformed archive is what the package
+          # installer reports as a missing certificate and what the security scanners
+          # report as malware.
+          unzip -tqq dist/microg-verify.apk
+          "$BUILD_TOOLS/apksigner" verify --print-certs dist/microg-verify.apk
+          "$BUILD_TOOLS/aapt" dump badging dist/microg-verify.apk | head -1
+
+          (cd dist && sha256sum microg-verify.apk > SHA256SUMS && cat SHA256SUMS)
+          rm -f verify.jks dist/microg-unaligned.apk
+
+      - name: "Upload the verified APK"
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: microg-verify-apk
+          if-no-files-found: warn
+          path: dist/
+
+      # Publish the built package into the `apk-build` branch of this mirror, so that the
+      # exact archive that was verified here can be downloaded and checked by hand.
+      - name: "Publish the APK to the apk-build branch"
+        if: github.repository == 'moeunzinkh-debug/Morphe-clone-'
+        run: |
+          set -uo pipefail
+          SRC="$RUNNER_TEMP/apkout/dist"
+          rm -rf "$RUNNER_TEMP/apkout"
+          mkdir -p "$SRC"
+          cp dist/microg-verify.apk dist/SHA256SUMS "$SRC/"
+
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git branch -D apk-build 2>/dev/null || true
+          git checkout --orphan apk-build
+          git rm -rfq --ignore-unmatch .
+          git clean -fdxq
+          mkdir -p dist
+          cp "$SRC/SHA256SUMS" dist/
+
+          # The universal APK is over the 100 MB that GitHub allows for a single file in a
+          # push, so it is published in parts that are concatenated again after a checkout.
+          split -b 50m -a 2 -d "$SRC/microg-verify.apk" dist/microg-verify.apk.part-
+
+          git add -A
+          git commit -q -m "Verified APK build (split into parts, concatenate them in order)"
+
+          if OUT="$(git push -f origin apk-build 2>&1)"; then
+            echo "::notice::published the verified APK to the apk-build branch"
+          else
+            echo "::error::could not publish the APK: $(echo "$OUT" | tr '\n' ' ' | cut -c1-800)"
+            exit 1
+          fi

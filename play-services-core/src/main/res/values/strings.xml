@@ -256,6 +256,7 @@ Please set up a password, PIN, or pattern lock screen."</string>
     <string name="update_ignore">Ignore</string>
     <string name="update_downloading_title">Downloading update…</string>
     <string name="update_download_failed">Download failed. Check your connection and try again.</string>
+    <string name="update_download_invalid">The downloaded update file is damaged or incomplete, so it was not installed. Please try again.</string>
     <string name="update_signature_mismatch">App cannot be updated, signatures are different.</string>
     <string name="update_failed_title">Update failed</string>
     <string name="update_permission_required_title">Permission required</string>
