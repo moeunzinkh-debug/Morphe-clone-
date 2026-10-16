@@ -166,6 +166,10 @@ object AppUpdater {
             .create()
         dialog.show()
 
+        // The release API reports the exact size of the asset, so a truncated download can
+        // be detected before the broken file is handed to the package installer.
+        val expectedSize = update?.assetSize ?: 0L
+
         Thread {
             val file = downloadUrlCancellable(url, File(activity.cacheDir, "$DOWNLOAD_DIR/$DOWNLOAD_FILE"), { isCancelled }) { conn ->
                 activeConnection = conn
@@ -179,7 +183,7 @@ object AppUpdater {
                     showErrorDialog(activity, activity.getString(R.string.update_download_failed))
                 } else {
                     Log.i(TAG, "Update downloaded: ${file.length()} bytes -> ${file.absolutePath}")
-                    launchInstaller(activity, file)
+                    launchInstaller(activity, file, expectedSize)
                 }
             }
         }.start()
@@ -224,6 +228,9 @@ object AppUpdater {
 
         Thread {
             val candidateUrls = mutableListOf<String>()
+            // Size of the release asset per URL, as reported by the release API. Only the
+            // API-provided links carry one; the direct download fallbacks stay unknown.
+            val candidateSizes = mutableMapOf<String, Long>()
 
             // 1. Query GitHub API for release assets
             val update = fetchLatestUpdate(
@@ -238,6 +245,7 @@ object AppUpdater {
 
             if (update?.assetUrl?.isNotEmpty() == true && update.assetName.lowercase().contains("noicon")) {
                 candidateUrls.add(update.assetUrl)
+                candidateSizes[update.assetUrl] = update.assetSize
             }
 
             // 2. Direct GitHub release asset URL fallback
@@ -254,6 +262,7 @@ object AppUpdater {
 
             val targetFile = File(activity.cacheDir, "$DOWNLOAD_DIR/microg-re-noicon-update.apk")
             var downloadedFile: File? = null
+            var downloadedSize = 0L
 
             for (url in candidateUrls) {
                 if (isCancelled) break
@@ -263,6 +272,7 @@ object AppUpdater {
                 }
                 if (file != null && file.length() > 0L) {
                     downloadedFile = file
+                    downloadedSize = candidateSizes[url] ?: 0L
                     break
                 }
             }
@@ -276,7 +286,7 @@ object AppUpdater {
                     showErrorDialog(activity, activity.getString(R.string.update_download_failed))
                 } else {
                     Log.i(TAG, "No-icon variant downloaded: ${downloadedFile.length()} bytes -> ${downloadedFile.absolutePath}")
-                    launchInstaller(activity, downloadedFile)
+                    launchInstaller(activity, downloadedFile, downloadedSize)
                 }
             }
         }.start()
@@ -629,16 +639,17 @@ object AppUpdater {
         isLifecycleRegistered = true
     }
 
-    private fun launchInstaller(context: Context, file: File) {
-        if (!checkSignaturesMatch(context, file)) {
-            Log.e(TAG, "Signature mismatch between installed app and downloaded APK")
-            showErrorDialog(context, context.getString(R.string.update_signature_mismatch))
+    private fun launchInstaller(context: Context, file: File, expectedSize: Long = 0L) {
+        val validation = validateDownloadedApk(context, file, expectedSize)
+        if (!validation.isValid) {
+            Log.e(TAG, "Refusing to install the downloaded update: ${validation.reason}")
+            showErrorDialog(context, context.getString(validation.messageRes))
             return
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !context.packageManager.canRequestPackageInstalls()) {
             if (context is Activity) {
-                ensureInstallPermission(context) { launchInstaller(it, file) }
+                ensureInstallPermission(context) { launchInstaller(it, file, expectedSize) }
             } else {
                 showErrorDialog(context, context.getString(R.string.update_download_failed))
             }
@@ -658,20 +669,129 @@ object AppUpdater {
         }
     }
 
-    private fun checkSignaturesMatch(context: Context, apkFile: File): Boolean {
-        val pm = context.packageManager
-        val installedSignatures = getSignatures(pm, context.packageName, null)
-        val apkSignatures = getSignatures(pm, null, apkFile.absolutePath)
+    /**
+     * Outcome of validating a downloaded update package.
+     *
+     * @param isValid true when the package may be handed to the system installer
+     * @param messageRes the error to show the user, only meaningful when [isValid] is false
+     * @param reason technical detail for the log, only meaningful when [isValid] is false
+     */
+    internal class ApkValidation(
+        val isValid: Boolean,
+        val messageRes: Int = R.string.update_download_invalid,
+        val reason: String = ""
+    )
 
-        if (installedSignatures.isEmpty() || apkSignatures.isEmpty()) {
-            return true
+    /**
+     * Checks that [apkFile] is a well formed APK archive of the expected size.
+     *
+     * A truncated download keeps the local file headers but loses the central directory,
+     * so the file cannot be opened as a ZIP any more. Such a file is what the package
+     * installer rejects with a misleading "its certificates are missing" error, and what
+     * the OEM security managers and Play Protect scan and report as malware.
+     *
+     * @param expectedSize the size the release API reported for the asset, or 0 when unknown
+     * @return null when the archive is good, otherwise a description of the problem
+     */
+    internal fun validateApkArchive(apkFile: File, expectedSize: Long): String? {
+        if (!apkFile.isFile || apkFile.length() <= 0L) {
+            return "the downloaded file is empty"
         }
 
-        return apkSignatures.any { apkSig ->
+        if (expectedSize > 0L && apkFile.length() != expectedSize) {
+            return "size mismatch: expected $expectedSize bytes, got ${apkFile.length()} bytes"
+        }
+
+        val entries = try {
+            ZipFile(apkFile).use { zip ->
+                zip.entries().asSequence().map { it.name }.toSet()
+            }
+        } catch (e: Exception) {
+            return "not a valid APK/ZIP archive: ${e.message}"
+        }
+        if (!entries.contains("AndroidManifest.xml")) {
+            return "not an APK: AndroidManifest.xml is missing"
+        }
+        if (entries.none { it.startsWith("classes") && it.endsWith(".dex") }) {
+            return "not an APK: it holds no dex code"
+        }
+
+        return null
+    }
+
+    /**
+     * Validates a downloaded update package before it is handed to the system installer.
+     *
+     * A truncated or tampered download is not a harmless error. The package installer
+     * rejects a broken archive with a misleading "the package is invalid / its certificates
+     * are missing" error, and the OEM security managers and Play Protect that scan the very
+     * same file report the application as malware. Google's own Play Protect guidance asks
+     * developers to "ensure your APKs use valid standard APK/ZIP headers" for exactly this
+     * reason.
+     *
+     * The checks are:
+     *  1. the file is a readable ZIP archive that holds an Android manifest and dex code,
+     *  2. its length matches the size the release API reported for the asset (when known),
+     *  3. it declares the same package name as the installed application, and
+     *  4. it is signed with one of the installed application's signing certificates.
+     */
+    private fun validateDownloadedApk(
+        context: Context,
+        apkFile: File,
+        expectedSize: Long
+    ): ApkValidation {
+        validateApkArchive(apkFile, expectedSize)?.let { problem ->
+            return ApkValidation(false, reason = problem)
+        }
+
+        val pm = context.packageManager
+        val archive = try {
+            pm.getPackageArchiveInfo(apkFile.absolutePath, 0)
+        } catch (e: Exception) {
+            null
+        }
+        if (archive == null) {
+            return ApkValidation(false, reason = "the Android package could not be parsed")
+        }
+        if (archive.packageName != context.packageName) {
+            return ApkValidation(
+                false,
+                reason = "package name mismatch: expected ${context.packageName}, got ${archive.packageName}"
+            )
+        }
+
+        val installedSignatures = getSignatures(pm, context.packageName, null)
+        val apkSignatures = getSignatures(pm, null, apkFile.absolutePath)
+        if (installedSignatures.isEmpty()) {
+            return ApkValidation(
+                false,
+                messageRes = R.string.update_signature_mismatch,
+                reason = "the installed application's signature could not be read"
+            )
+        }
+        if (apkSignatures.isEmpty()) {
+            // Fail closed: an archive whose certificates cannot be read is exactly the
+            // broken package the installer and the security scanners complain about.
+            return ApkValidation(
+                false,
+                messageRes = R.string.update_signature_mismatch,
+                reason = "the downloaded package has no readable certificates"
+            )
+        }
+        val signedWithKnownKey = apkSignatures.any { apkSig ->
             installedSignatures.any { installedSig ->
                 apkSig.toByteArray().contentEquals(installedSig.toByteArray())
             }
         }
+        if (!signedWithKnownKey) {
+            return ApkValidation(
+                false,
+                messageRes = R.string.update_signature_mismatch,
+                reason = "the downloaded package is signed with a different key"
+            )
+        }
+
+        return ApkValidation(true)
     }
 
     private fun getSignatures(pm: PackageManager, packageName: String?, apkPath: String?): List<android.content.pm.Signature> {
@@ -740,8 +860,18 @@ object AppUpdater {
                     return null
                 }
 
+                // The advertised length of the body, used to detect a transfer that ends
+                // early. It is only meaningful when the body is not encoded.
+                val contentEncoding = conn.getHeaderField("Content-Encoding")
+                val expectedBodyLength = if (contentEncoding.isNullOrEmpty() || contentEncoding.equals("identity", ignoreCase = true)) {
+                    conn.getHeaderField("Content-Length")?.toLongOrNull()
+                } else {
+                    null
+                }
+
                 target.parentFile?.mkdirs()
                 val input = conn.inputStream
+                var received = 0L
                 try {
                     FileOutputStream(target).use { out ->
                         val buffer = ByteArray(8192)
@@ -753,11 +883,21 @@ object AppUpdater {
                                 return null
                             }
                             out.write(buffer, 0, bytesRead)
+                            received += bytesRead
                         }
                     }
                 } finally {
                     try { input.close() } catch (_: Exception) {}
                     conn.disconnect()
+                }
+
+                // A connection that ends early leaves a truncated file behind. Handing that
+                // to the installer makes it report missing certificates, and the security
+                // scanners that see the malformed archive report the app as malware.
+                if (expectedBodyLength != null && expectedBodyLength > 0L && received != expectedBodyLength) {
+                    Log.e(TAG, "Truncated download: expected $expectedBodyLength bytes, got $received")
+                    target.delete()
+                    return null
                 }
 
                 return if (target.length() > 0L && !isCancelled()) target else null
@@ -1126,6 +1266,9 @@ object AppUpdater {
 
         Thread {
             val candidateUrls = mutableListOf<String>()
+            // Size of the release asset per URL, as reported by the release API. Only the
+            // API-provided links carry one; the direct download fallbacks stay unknown.
+            val candidateSizes = mutableMapOf<String, Long>()
 
             try {
                 val text = httpGet("$RELEASES_URL?per_page=15")
@@ -1150,6 +1293,7 @@ object AppUpdater {
                         val url = match?.get("browser_download_url")?.asString
                         if (!url.isNullOrEmpty() && !candidateUrls.contains(url)) {
                             candidateUrls.add(url)
+                            candidateSizes[url] = match?.get("size")?.asLong ?: 0L
                         }
                     }
                 }
@@ -1166,6 +1310,7 @@ object AppUpdater {
 
             val targetFile = File(activity.cacheDir, "$DOWNLOAD_DIR/microg-re-abi-update.apk")
             var downloadedFile: File? = null
+            var downloadedSize = 0L
             for (url in candidateUrls) {
                 if (isCancelled) break
                 Log.i(TAG, "Attempting ABI variant download from: $url")
@@ -1174,6 +1319,7 @@ object AppUpdater {
                 }
                 if (file != null && file.length() > 0L) {
                     downloadedFile = file
+                    downloadedSize = candidateSizes[url] ?: 0L
                     break
                 }
             }
@@ -1186,7 +1332,7 @@ object AppUpdater {
                     showErrorDialog(activity, activity.getString(R.string.update_download_failed))
                 } else {
                     Log.i(TAG, "ABI variant downloaded: ${downloadedFile.length()} bytes")
-                    launchInstaller(activity, downloadedFile)
+                    launchInstaller(activity, downloadedFile, downloadedSize)
                 }
             }
         }.start()
