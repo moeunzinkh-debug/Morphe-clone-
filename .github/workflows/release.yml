@@ -148,6 +148,30 @@ jobs:
       - name: "List APKs"
         run: ls -lh dist/
 
+      - name: "Validate APKs"
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          for apk in dist/*.apk; do
+            echo "Validating $apk"
+            # A truncated or otherwise malformed archive is reported as malware by the OEM
+            # security scanners and as a missing certificate by the package installer, so
+            # such a build must never reach a release.
+            unzip -tqq "$apk"
+            if [ -x "$BUILD_TOOLS/apksigner" ]; then
+              "$BUILD_TOOLS/apksigner" verify --print-certs "$apk" > /dev/null
+            fi
+            if [ -x "$BUILD_TOOLS/aapt" ]; then
+              "$BUILD_TOOLS/aapt" dump badging "$apk" | head -1
+            fi
+          done
+
+      - name: "Generate checksums"
+        run: |
+          cd dist
+          sha256sum *.apk > SHA256SUMS
+          cat SHA256SUMS
+
 #      - name: "Create release"
 #        uses: softprops/action-gh-release@v2
 #        with:
@@ -203,3 +227,11 @@ jobs:
           if-no-files-found: error
           archive: false
           path: dist/microg-${{ steps.version.outputs.tag }}-noicon-armeabi-v7a.apk
+
+      - name: "Upload checksums"
+        uses: actions/upload-artifact@v7
+        with:
+          name: MicroG-RE-SHA256SUMS
+          if-no-files-found: error
+          archive: false
+          path: dist/SHA256SUMS
